@@ -1,0 +1,983 @@
+from pycocotools.coco import COCO
+import numpy as np
+import skimage.io as io
+import matplotlib.pyplot as plt
+import pylab
+import cv2
+import math
+import Polygon as plg
+from tqdm import tqdm
+
+from pycocotools.coco import COCO
+
+from .custom import CustomDataset
+from .registry import DATASETS
+import os.path as osp
+import warnings
+
+import mmcv
+import numpy as np
+from imagecorruptions import corrupt
+from mmcv.parallel import DataContainer as DC
+from torch.utils.data import Dataset
+import torch
+
+from .extra_aug import ExtraAugmentation
+from .registry import DATASETS
+from .transforms import (BboxTransform, ImageTransform, MaskTransform,
+                         Numpy2Tensor, SegMapTransform, SegmapTransform)
+from .utils import random_scale, to_tensor, contour_random_walk
+from IPython import embed
+import time
+from scipy.spatial import distance
+
+INF = 1e8
+# add for sampling 360 points
+NUM_SAMPLING_POINTS = 360
+
+
+def get_angle(v1, v2=[0, 0, 100, 0]):
+    dx1 = v1[2] - v1[0]
+    dy1 = v1[3] - v1[1]
+    dx2 = v2[2] - v2[0]
+    dy2 = v2[3] - v2[1]
+    angle1 = math.atan2(dy1, dx1)
+    angle1 = int(angle1 * 180 / math.pi)
+    angle2 = math.atan2(dy2, dx2)
+    angle2 = int(angle2 * 180 / math.pi)
+    included_angle = angle2 - angle1
+    if included_angle < 0:
+        included_angle += 360
+    return included_angle
+
+
+@DATASETS.register_module
+class Coco_Seg_Dataset_gt(CustomDataset):
+    CLASSES = ('person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus',
+               'train', 'truck', 'boat', 'traffic_light', 'fire_hydrant',
+               'stop_sign', 'parking_meter', 'bench', 'bird', 'cat', 'dog',
+               'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe',
+               'backpack', 'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee',
+               'skis', 'snowboard', 'sports_ball', 'kite', 'baseball_bat',
+               'baseball_glove', 'skateboard', 'surfboard', 'tennis_racket',
+               'bottle', 'wine_glass', 'cup', 'fork', 'knife', 'spoon', 'bowl',
+               'banana', 'apple', 'sandwich', 'orange', 'broccoli', 'carrot',
+               'hot_dog', 'pizza', 'donut', 'cake', 'chair', 'couch',
+               'potted_plant', 'bed', 'dining_table', 'toilet', 'tv', 'laptop',
+               'mouse', 'remote', 'keyboard', 'cell_phone', 'microwave',
+               'oven', 'toaster', 'sink', 'refrigerator', 'book', 'clock',
+               'vase', 'scissors', 'teddy_bear', 'hair_drier', 'toothbrush')
+
+    def __init__(self,
+                 ann_file,
+                 img_prefix,
+                 img_scale,
+                 img_norm_cfg,
+                 multiscale_mode='value',
+                 size_divisor=None,
+                 proposal_file=None,
+                 num_max_proposals=1000,
+                 flip_ratio=0,
+                 with_mask=True,
+                 with_crowd=True,
+                 with_label=True,
+                 with_semantic_seg=False,
+                 seg_prefix=None,
+                 seg_scale_factor=1,
+                 extra_aug=None,
+                 resize_keep_ratio=True,
+                 corruption=None,
+                 corruption_severity=1,
+                 skip_img_without_anno=True,
+                 test_mode=False,
+                 fill_instance=False,
+                 center_fill_before=False,
+                 num_sample_points=36,
+                 fixed_gt=True,
+                 sort=False,
+                 polar_coordinate=True,
+                 ensure_inner=False,
+                 explore_times=0,
+                 normalize_factor=1):
+        super(Coco_Seg_Dataset_gt, self).__init__(
+            ann_file, img_prefix, img_scale, img_norm_cfg, multiscale_mode,
+            size_divisor, proposal_file, num_max_proposals, flip_ratio,
+            with_mask, with_crowd, with_label, with_semantic_seg, seg_prefix,
+            seg_scale_factor, extra_aug, resize_keep_ratio, corruption,
+            corruption_severity, skip_img_without_anno, test_mode)
+        assert 360 % num_sample_points == 0, '360 is not multiple to sampling interval'
+
+        self.fill_instance = fill_instance
+        self.center_fill_before = center_fill_before
+        self.num_sample_points = num_sample_points
+        self.sort = sort
+        self.fixed_gt = fixed_gt  # whether to need to make sure the center is in mask
+        self.polar_coordinate = polar_coordinate
+        self.ensure_inner = ensure_inner
+        self.explore_times = explore_times
+        self.normalize_factor = normalize_factor
+        if self.fixed_gt:
+            print('Ground truth is fixed')
+        if self.ensure_inner:
+            print('Choose points inside mask as center')
+
+        if self.fill_instance:
+            print(
+                'If there exist more than one parts in a mask, fill it first')
+            if self.center_fill_before:
+                print(
+                    'The center is the average of coordinates of several parts'
+                )
+            else:
+                print('after filling, calculate the center')
+        if self.normalize_factor < 1:
+            print('normalize the deviation')
+
+    def load_annotations(self, ann_file):
+        self.coco = COCO(ann_file)
+        self.cat_ids = self.coco.getCatIds()
+        self.cat2label = {
+            cat_id: i + 1
+            for i, cat_id in enumerate(self.cat_ids)
+        }
+        self.img_ids = self.coco.getImgIds()
+        img_infos = []
+        for i in self.img_ids:
+            info = self.coco.loadImgs([i])[0]
+            info['filename'] = info['file_name']
+            img_infos.append(info)
+        return img_infos
+
+    def get_ann_info(self, idx):
+        img_id = self.img_infos[idx]['id']
+        ann_ids = self.coco.getAnnIds(imgIds=[img_id])
+        ann_info = self.coco.loadAnns(ann_ids)
+        return self._parse_ann_info(ann_info, self.with_mask)
+
+    def _filter_imgs(self, min_size=32):
+        """Filter images too small or without ground truths."""
+        valid_inds = []
+        ids_with_ann = set(_['image_id'] for _ in self.coco.anns.values())
+        for i, img_info in enumerate(self.img_infos):
+            if self.img_ids[i] not in ids_with_ann:
+                continue
+            if min(img_info['width'], img_info['height']) >= min_size:
+                valid_inds.append(i)
+        return valid_inds
+
+    def _parse_ann_info(self, ann_info, with_mask=True):
+        """Parse bbox and mask annotation.
+
+        Args:
+            ann_info (list[dict]): Annotation info of an image.
+            with_mask (bool): Whether to parse mask annotations.
+
+        Returns:
+            dict: A dict containing the following keys: bboxes, bboxes_ignore,
+                labels, masks, mask_polys, poly_lens.
+        """
+        gt_bboxes = []
+        gt_labels = []
+        gt_bboxes_ignore = []
+        # Two formats are provided.
+        # 1. mask: a binary map of the same size of the image.
+        # 2. polys: each mask consists of one or several polys, each poly is a
+        # list of float.
+
+        self.debug = False
+
+        if with_mask:
+            gt_masks = []
+            gt_mask_polys = []
+            gt_poly_lens = []
+
+        if self.debug:
+            count = 0
+            total = 0
+        for i, ann in enumerate(ann_info):
+            if ann.get('ignore', False):
+                continue
+            x1, y1, w, h = ann['bbox']
+            # filter bbox < 10
+            if self.debug:
+                total += 1
+
+            if ann['area'] <= 15 or (
+                    w < 10 and h < 10) or self.coco.annToMask(ann).sum() < 15:
+                # print('filter, area:{},w:{},h:{}'.format(ann['area'],w,h))
+                if self.debug:
+                    count += 1
+                continue
+
+            bbox = [x1, y1, x1 + w - 1, y1 + h - 1]
+            if ann['iscrowd']:
+                gt_bboxes_ignore.append(bbox)
+            else:
+                gt_bboxes.append(bbox)
+                gt_labels.append(self.cat2label[ann['category_id']])
+            if with_mask:
+                gt_masks.append(self.coco.annToMask(ann))
+                mask_polys = [
+                    p for p in ann['segmentation'] if len(p) >= 6
+                ]  # valid polygons have >= 3 points (6 coordinates)
+                poly_lens = [len(p) for p in mask_polys]
+                gt_mask_polys.append(mask_polys)
+                gt_poly_lens.extend(poly_lens)
+
+        if self.debug:
+            print('filter:', count / total)
+        if gt_bboxes:
+            gt_bboxes = np.array(gt_bboxes, dtype=np.float32)
+            gt_labels = np.array(gt_labels, dtype=np.int64)
+        else:
+            gt_bboxes = np.zeros((0, 4), dtype=np.float32)
+            gt_labels = np.array([], dtype=np.int64)
+
+        if gt_bboxes_ignore:
+            gt_bboxes_ignore = np.array(gt_bboxes_ignore, dtype=np.float32)
+        else:
+            gt_bboxes_ignore = np.zeros((0, 4), dtype=np.float32)
+
+        ann = dict(bboxes=gt_bboxes,
+                   labels=gt_labels,
+                   bboxes_ignore=gt_bboxes_ignore)
+
+        if with_mask:
+            ann['masks'] = gt_masks
+            # poly format is not used in the current implementation
+            ann['mask_polys'] = gt_mask_polys
+            ann['poly_lens'] = gt_poly_lens
+        return ann
+
+    def prepare_train_img(self, idx):
+        '''
+        对不含bbox的图像直接返回空；然后对图像进行预处理
+        输出：dataset字典，dataset[i]包含键值
+        'img':预处理后的图像, DataContainer, img.data: tensor(3,768,1280)
+        'img_meta': 原始图像、预处理图像信息，DataContainer, img_meta.data
+        'gt_bboxes': 图中实例的bbounding box，DataContainer, gt_bboxes.data: tensor(k, 4)
+        'gt_labels': 图中每个实例的下标
+        'gt_masks': 图中每个实例的mask, DataContainer, gt_labels.data: tensor(k,768,1280)
+        '_gt_labels': 不同尺度的特征图中每个像素对应的标签，DataContainer,_gt_labels.data: tensor(768*1280*(1/64+1/256+1/32/32+1/64/64+1/128/128)),即20460
+        '_gt_bboxes'：不同尺度的特征图中每个像素对应的bbox，DataContainer,_gt_bboxes.data: tensor(20460,4)
+        '_gt_masks'：不同尺度的特征图中每个像素对应的轮廓点极径，DataContainer,_gt_masks.data: tensor(20460,36)
+        '_contour_all_points'：不同尺度的特征图中每个像素对应的360个轮廓点的极径，DataContainer,_contour_all_points.data: tensor(20460,360)
+        '''
+
+        img_info = self.img_infos[idx]
+        img = mmcv.imread(osp.join(self.img_prefix, img_info['filename']))
+        # corruption
+        if self.corruption is not None:
+            img = corrupt(img,
+                          severity=self.corruption_severity,
+                          corruption_name=self.corruption)
+        # load proposals if necessary
+        if self.proposals is not None:
+            proposals = self.proposals[idx][:self.num_max_proposals]
+            # TODO: Handle empty proposals properly. Currently images with
+            # no proposals are just ignored, but they can be used for
+            # training in concept.
+            if len(proposals) == 0:
+                return None
+            if not (proposals.shape[1] == 4 or proposals.shape[1] == 5):
+                raise AssertionError(
+                    'proposals should have shapes (n, 4) or (n, 5), '
+                    'but found {}'.format(proposals.shape))
+            if proposals.shape[1] == 5:
+                scores = proposals[:, 4, None]
+                proposals = proposals[:, :4]
+            else:
+                scores = None
+
+        ann = self.get_ann_info(idx)
+
+        gt_bboxes = ann['bboxes']
+        gt_labels = ann['labels']
+        # some datasets provide bbox annotations as ignore/crowd/difficult,
+        # if `with_crowd` is True, then these info is returned.
+        if self.with_crowd:
+            gt_bboxes_ignore = ann['bboxes_ignore']
+
+        # skip the image if there is no valid gt bbox
+        if len(gt_bboxes) == 0 and self.skip_img_without_anno:
+            warnings.warn('Skip the image "%s" that has no valid gt bbox' %
+                          osp.join(self.img_prefix, img_info['filename']))
+            return None
+
+        # apply transforms，比如：resacle、归一化、翻转、pad、通道转置
+        flip = True if np.random.rand() < self.flip_ratio else False
+        # randomly sample a scale
+        img_scale = random_scale(self.img_scales, self.multiscale_mode)
+        img, img_shape, pad_shape, scale_factor = self.img_transform(
+            img, img_scale, flip, keep_ratio=self.resize_keep_ratio)
+
+        img = img.copy()
+        if self.with_seg:
+            gt_seg = mmcv.imread(osp.join(
+                self.seg_prefix, img_info['filename'].replace('jpg', 'png')),
+                                 flag='unchanged')
+            gt_seg = self.seg_transform(gt_seg.squeeze(), img_scale, flip)
+            gt_seg = mmcv.imrescale(gt_seg,
+                                    self.seg_scale_factor,
+                                    interpolation='nearest')
+            gt_seg = gt_seg[None, ...]
+        if self.proposals is not None:
+            proposals = self.bbox_transform(proposals, img_shape, scale_factor,
+                                            flip)
+            proposals = np.hstack([proposals, scores
+                                   ]) if scores is not None else proposals
+        gt_bboxes = self.bbox_transform(gt_bboxes, img_shape, scale_factor,
+                                        flip)
+        if self.with_crowd:
+            gt_bboxes_ignore = self.bbox_transform(gt_bboxes_ignore, img_shape,
+                                                   scale_factor, flip)
+        if self.with_mask:
+            gt_masks = self.mask_transform(ann['masks'], pad_shape,
+                                           scale_factor, flip)
+
+        ori_shape = (img_info['height'], img_info['width'], 3)
+        img_meta = dict(file_name=img_info['filename'],
+                        ori_shape=ori_shape,
+                        img_shape=img_shape,
+                        pad_shape=pad_shape,
+                        scale_factor=scale_factor,
+                        flip=flip)
+
+        data = dict(img=DC(to_tensor(img), stack=True),
+                    img_meta=DC(img_meta, cpu_only=True),
+                    gt_bboxes=DC(to_tensor(gt_bboxes)))
+
+        if self.with_label:
+            data['gt_labels'] = DC(to_tensor(gt_labels))
+        if self.with_crowd:
+            data['gt_bboxes_ignore'] = DC(to_tensor(gt_bboxes_ignore))
+        if self.with_mask:
+            data['gt_masks'] = DC(gt_masks, cpu_only=True)
+
+        # --------------------offline ray label generation-----------------------------
+
+        self.center_sample = True
+        self.use_mask_center = True
+        self.radius = 1.5
+        self.strides = [8, 16, 32, 64, 128]
+        self.regress_ranges = (
+            (-1, 64), (64, 128), (128, 256), (256, 512), (512, INF)
+        )  # 限定不同特征层的像素回归极径的值的范围不同，低级的层（尺寸最大）最小
+        featmap_sizes = self.get_featmap_size(pad_shape)
+        self.featmap_sizes = featmap_sizes
+        num_levels = len(self.strides)
+        all_level_points = self.get_points(featmap_sizes)  # 所有特征点对应到原图的坐标
+        self.num_points_per_level = [i.size()[0] for i in all_level_points]
+
+        expanded_regress_ranges = [
+            all_level_points[i].new_tensor(
+                self.regress_ranges[i])[None].expand_as(all_level_points[i])
+            for i in range(num_levels)
+        ]  # 将这个回归的范围限制赋给了特征图每一层的每个像素
+        concat_regress_ranges = torch.cat(expanded_regress_ranges, dim=0)
+        concat_points = torch.cat(all_level_points, 0)
+        gt_masks = gt_masks[:len(gt_bboxes)]
+
+        gt_bboxes = torch.Tensor(gt_bboxes)
+        gt_labels = torch.Tensor(gt_labels)
+
+        # 获取对应的极径极角,或是对应的二维坐标
+        if self.polar_coordinate:
+            _labels, _bbox_targets, _mask_targets, _angle_targets = self.polar_target_single(
+                gt_bboxes, gt_masks, gt_labels, concat_points,
+                concat_regress_ranges)
+        else:
+            _labels, _bbox_targets, _mask_targets = self.polar_target_single(
+                gt_bboxes, gt_masks, gt_labels, concat_points,
+                concat_regress_ranges)
+
+        data['_gt_labels'] = DC(_labels)
+        data['_gt_bboxes'] = DC(_bbox_targets)
+
+        if self.polar_coordinate:
+            data['_gt_radius'] = DC(_mask_targets)
+            data['_gt_angles'] = DC(_angle_targets)
+        else:
+            data['_gt_xy_targets'] = DC(_mask_targets)  # (num, 36, 2)
+
+        # --------------------offline ray label generation-----------------------------
+
+        return data
+
+    def get_featmap_size(self, shape):
+        h, w = shape[:2]
+        featmap_sizes = []
+        for i in self.strides:
+            featmap_sizes.append([int(h / i), int(w / i)])
+        return featmap_sizes
+
+    def get_points(self, featmap_sizes):
+        '''
+        得到指定尺度范围的所有特征图在原图对应的坐标 (xs+s//2, ys+s//2)
+        '''
+        mlvl_points = []
+        for i in range(len(featmap_sizes)):
+            mlvl_points.append(
+                self.get_points_single(featmap_sizes[i], self.strides[i]))
+        return mlvl_points
+
+    def get_points_single(self, featmap_size, stride):
+        '''
+        得到传入尺寸的feature map在原图对应的坐标 (xs+s//2, ys+s//2)
+        '''
+        h, w = featmap_size
+        x_range = torch.arange(0, w * stride, stride)
+        y_range = torch.arange(0, h * stride, stride)
+        y, x = torch.meshgrid(y_range, x_range)  # 将x和y组成n^2个数
+        points = torch.stack(
+            (x.reshape(-1), y.reshape(-1)),
+            dim=-1) + stride // 2  # (xs+s//2, ys+s//2)是最靠近像素对应的区域的中心
+        return points.float()  # 是反的
+
+    def polar_target_single(self, gt_bboxes, gt_masks, gt_labels, points,
+                            regress_ranges):
+        '''
+        对feature map上的每个点确定用极坐标表示的bbox和轮廓点
+
+        input:
+        gt_bboxes: 表示图中所有实例的bbox shape (k,4) (x1,y1,x2,y2)
+        gt_masks: shape (k,768,1280)
+        gt_labels: shape (k)
+        points: 所有特征图上所有的点(对应到原图的位置)
+        regress_ranges: 所有特征图上所有点（对应回原图的坐标）的回归值的范围
+        output:
+        labels: 每个点对应回原图的未知的类别（0为背景）
+        bbox_taegets: 每个像素对应回原图的点距离其bbox的四条边的距离（bbox是按照mask的assign方法找的）
+        mask_targets: 每个像素对应回原图的点如果在某bbox内或者在回归范围内，则将实例指定到该点
+        '''
+        num_points = points.size(0)
+        num_gts = gt_labels.size(0)
+        if num_gts == 0:
+            return gt_labels.new_zeros(num_points), \
+                gt_bboxes.new_zeros((num_points, 4))
+
+        # areas = (gt_bboxes[:, 2] - gt_bboxes[:, 0] + 1) * (gt_bboxes[:, 3] -
+        #                                                    gt_bboxes[:, 1] + 1)
+        # # TODO: figure out why these two are different
+        # # areas = areas[None].expand(num_points, num_gts)
+        # areas = areas[None].repeat(num_points, 1)  # [None]升维操作
+        # regress_ranges = regress_ranges[:, None, :].expand(
+        #     num_points, num_gts, 2)  # 将原有的回归范围限制又复制了实例个数次
+        # gt_bboxes = gt_bboxes[None].expand(num_points, num_gts, 4)
+        # # xs ys 分别是points的x y坐标
+        # xs, ys = points[:, 0], points[:, 1]
+        # xs = xs[:, None].expand(num_points, num_gts)
+        # ys = ys[:, None].expand(num_points, num_gts)
+        # left = xs - gt_bboxes[..., 0]
+        # right = gt_bboxes[..., 2] - xs
+        # top = ys - gt_bboxes[..., 1]
+        # bottom = gt_bboxes[..., 3] - ys
+        # # feature map上所有点对于gtbox的上下左右距离 [num_pix, num_gt, 4]
+        # bbox_targets = torch.stack((left, top, right, bottom), -1)
+
+        # mask targets 也按照这种写 同时labels 得从bbox中心修改成mask 重心
+        mask_centers = []
+        mask_contours = []
+        instance_used_idx = [
+        ]  # 记录所有使用的instance，在固定gt时，有些实例因为太小找不到内部的中心点没有参与计算
+        # 第一步 先算k个重心  return [num_gt, 2]
+        for i in range(gt_masks.shape[0]):
+            mask = gt_masks[i]
+            cnt, contour = self.get_single_centerpoint(mask)
+            if cnt is None:
+                print('skip a vey small mask')
+                continue
+            contour = contour[0]  # contour with the largest area
+            contour = torch.Tensor(contour).float()
+            y, x = cnt
+            mask_centers.append([x, y])  # mask center是正的
+            mask_contours.append(contour)
+            instance_used_idx.append(i)
+        # 在固定gt时，会依据mask中心是否可以在mask内部，滤除掉不符合条件的实例
+        # 然后先计算bbox gt，再计算mask gt
+        num_gts = len(instance_used_idx)
+        gt_bboxes, gt_labels = gt_bboxes[instance_used_idx], gt_labels[
+            instance_used_idx]
+        areas = (gt_bboxes[:, 2] - gt_bboxes[:, 0] + 1) * (gt_bboxes[:, 3] -
+                                                           gt_bboxes[:, 1] + 1)
+        # TODO: figure out why these two are different
+        # areas = areas[None].expand(num_points, num_gts)
+        areas = areas[None].repeat(num_points, 1)  # [None]升维操作
+        regress_ranges = regress_ranges[:, None, :].expand(
+            num_points, num_gts, 2)  # 将原有的回归范围限制又复制了实例个数次
+        gt_bboxes = gt_bboxes[None].expand(num_points, num_gts, 4)
+        # xs ys 分别是points的x y坐标
+        xs, ys = points[:, 0], points[:, 1]  # points是反的
+        xs = xs[:, None].expand(num_points, num_gts)
+        ys = ys[:, None].expand(num_points, num_gts)
+        left = xs - gt_bboxes[..., 0]
+        right = gt_bboxes[..., 2] - xs
+        top = ys - gt_bboxes[..., 1]
+        bottom = gt_bboxes[..., 3] - ys
+        # feature map上所有点对于gtbox的上下左右距离 [num_pix, num_gt, 4]
+        bbox_targets = torch.stack((left, top, right, bottom), -1)
+
+        # 分配实例到像素，制作_gt_mask
+        mask_centers = torch.Tensor(mask_centers).float()
+        # 把mask_centers assign到不同的层上,根据regress_range和重心的位置
+        mask_centers = mask_centers[None].expand(
+            num_points, num_gts, 2)  # 每个特征点对应原图像素都可能是num_gts个实例中的一个
+
+        # -------------------------------------------------------------------------------------------------------------------------------------------------------------
+        # condition1: inside a gt bbox
+        # 加入center sample
+        if self.center_sample:
+            strides = [8, 16, 32, 64, 128]
+            if self.use_mask_center:
+                inside_gt_bbox_mask = self.get_mask_sample_region(
+                    gt_bboxes,
+                    mask_centers,
+                    strides,
+                    self.num_points_per_level,
+                    xs,
+                    ys,
+                    radius=self.radius)
+            else:
+                inside_gt_bbox_mask = self.get_sample_region(
+                    gt_bboxes,
+                    strides,
+                    self.num_points_per_level,
+                    xs,
+                    ys,
+                    radius=self.radius)
+        else:
+            inside_gt_bbox_mask = bbox_targets.min(-1)[0] > 0
+
+        # condition2: limit the regression range for each location
+        max_regress_distance = bbox_targets.max(-1)[0]  # 该点离bbox最远边界的距离
+
+        inside_regress_range = (
+            max_regress_distance >= regress_ranges[..., 0]) & (
+                max_regress_distance <= regress_ranges[..., 1])  # 最大回归距离在回归范围内
+
+        areas[inside_gt_bbox_mask == 0] = INF
+        areas[inside_regress_range == 0] = INF
+        min_area, min_area_inds = areas.min(
+            dim=1)  # 如果属于多个实例取面积最小的那个，不属于实例的面积会取INF
+
+        labels = gt_labels[min_area_inds]
+        labels[min_area == INF] = 0  # [num_gt] 介于0-80,背景像素为0
+
+        bbox_targets = bbox_targets[range(num_points), min_area_inds]
+        pos_inds = labels.nonzero().reshape(-1)  # positive examples index
+
+        if self.polar_coordinate:
+            angle_targets = torch.zeros(num_points, 36).float()
+            radius_targets = torch.zeros(num_points, 36).float()
+        else:
+            points_targets = torch.zeros(num_points, 36, 2).float()
+
+        pos_mask_ids = min_area_inds[pos_inds]
+
+        # 对于后面重复使用的mask仅等间隔采样一次轮廓点
+        pos_mask_ids_set = list(set(pos_mask_ids.data.numpy()))
+        points_sample_gt_dict = dict({})
+        for mask_id in pos_mask_ids_set:
+            mask_contour = mask_contours[mask_id][:, 0, :]
+            mask = gt_masks[mask_id]
+            points_sample_gt = contour_random_walk(
+                num_sample_points=self.num_sample_points,
+                all_contour_points=mask_contour,
+                mask=mask,
+                explore_times=self.explore_times,
+                num_steps=10,
+                step=1,
+                show_iou=False)
+            points_sample_gt_dict[mask_id] = points_sample_gt
+
+        for p, id in zip(pos_inds, pos_mask_ids):
+            x, y = points[p]
+            points_sample_gt = points_sample_gt_dict[id.numpy().tolist()]
+            # print('gt iou:', iou)
+            if self.polar_coordinate:
+                _, angle_targets[p], radius_targets[p] = self.get_angle_radius(
+                    x, y, points_sample_gt)
+            else:
+                points_targets[p] = self.get_deviation_xy(
+                    x, y, points_sample_gt)  # 仍然是y,x的形式
+                # 对每个正样本都会等间隔计算一次
+
+        # for p, id in zip(pos_inds, pos_mask_ids):
+        #     x, y = points[p]
+        #     pos_mask_contour = mask_contours[id]
+
+        #     # 对每个实例求点和坐标
+        #     mask = gt_masks[instance_used_idx][id]
+        #     import pdb
+        #     pdb.set_trace()
+        #     ct = pos_mask_contour[:, 0, :]
+        #     points_sample_gt = contour_random_walk(
+        #         num_sample_points=self.num_sample_points,
+        #         all_contour_points=ct,
+        #         mask=mask,
+        #         explore_times=self.explore_times,
+        #         num_steps=10,
+        #         step=1,
+        #         show_iou=False)
+
+        # # print('gt iou:', iou)
+        # if self.polar_coordinate:
+        #     _, angle_targets[p], radius_targets[p] = self.get_angle_radius(
+        #         x, y, points_sample_gt)
+        # else:
+        #     points_targets[p] = self.get_deviation_xy(
+        #         x, y, points_sample_gt)  # 仍然是y,x的形式
+
+        # from .utils import points_mask_iou
+        # print(points_mask_iou(points_sample_gt, mask))
+
+        # 可视化gt
+        # mask = gt_masks[instance_used_idx][id]
+        # mask = mask * 255
+        # mask = np.concatenate(
+        #     [mask[:, :, None], mask[:, :, None], mask[:, :, None]], axis=2)
+        # mask = cv2.circle(
+        #     mask, (x, y), 1,
+        #     (0, 0, 255))  # 当前像素,正样本像素不一定在物体内，在物体很小的情况下，可能在物体外部(1.5stride）
+        # mask = cv2.circle(mask,
+        #                   (mask_centers[p][id][1], mask_centers[p][id][0]),
+        #                   1, (255, 0, 0))  # real mass center
+
+        # mask = cv2.polylines(
+        #     mask,
+        #     points_sample_gt.numpy().astype(np.int32)[1:10][None, :, :],
+        #     True, (0, 0, 255), 2)
+        # mask = cv2.polylines(
+        #     mask,
+        #     points_sample_gt.numpy().astype(np.int32)[10:][None, :, :],
+        #     True, (255, 0, 0), 2)
+
+        # mask = cv2.polylines(
+        #     mask,
+        #     points_sample_gt.numpy().astype(np.int32)[:1][:, None, :],
+        #     True, (0, 255, 0), 2)
+        # cv2.imwrite('demo.jpg'.format(id), mask)
+        # import pdb
+        # pdb.set_trace()
+
+        #test for polar2cartesian
+        # from mmdet.models.anchor_heads.polarmask_double_gt_head import distance2mask
+        # import pdb
+        # pdb.set_trace()
+        # a = distance2mask(torch.Tensor([[x, y]]), radius_targets[p],
+        #                   angle_targets[p])
+        # print(a[0,:,:] == points_sample_gt.T)
+
+        if self.polar_coordinate:
+            return labels, bbox_targets, radius_targets, angle_targets
+        else:
+            return labels, bbox_targets, points_targets  # (36,2)
+
+    def get_sample_region(self,
+                          gt,
+                          strides,
+                          num_points_per,
+                          gt_xs,
+                          gt_ys,
+                          radius=1):
+        center_x = (gt[..., 0] + gt[..., 2]) / 2
+        center_y = (gt[..., 1] + gt[..., 3]) / 2
+        center_gt = gt.new_zeros(gt.shape)
+        # no gt
+        if center_x[..., 0].sum() == 0:
+            return gt_xs.new_zeros(gt_xs.shape, dtype=torch.uint8)
+
+        beg = 0
+        for level, n_p in enumerate(num_points_per):
+            end = beg + n_p
+            stride = strides[level] * radius
+            xmin = center_x[beg:end] - stride
+            ymin = center_y[beg:end] - stride
+            xmax = center_x[beg:end] + stride
+            ymax = center_y[beg:end] + stride
+            # limit sample region in gt
+            center_gt[beg:end, :, 0] = torch.where(xmin > gt[beg:end, :, 0],
+                                                   xmin, gt[beg:end, :, 0])
+            center_gt[beg:end, :, 1] = torch.where(ymin > gt[beg:end, :, 1],
+                                                   ymin, gt[beg:end, :, 1])
+            center_gt[beg:end, :, 2] = torch.where(xmax > gt[beg:end, :, 2],
+                                                   gt[beg:end, :, 2], xmax)
+            center_gt[beg:end, :, 3] = torch.where(ymax > gt[beg:end, :, 3],
+                                                   gt[beg:end, :, 3], ymax)
+            beg = end
+
+        left = gt_xs - center_gt[..., 0]
+        right = center_gt[..., 2] - gt_xs
+        top = gt_ys - center_gt[..., 1]
+        bottom = center_gt[..., 3] - gt_ys
+        center_bbox = torch.stack((left, top, right, bottom), -1)
+        inside_gt_bbox_mask = center_bbox.min(-1)[0] > 0  # 上下左右都>0 就是在bbox里面
+        return inside_gt_bbox_mask
+
+    def get_mask_sample_region(self,
+                               gt_bb,
+                               mask_center,
+                               strides,
+                               num_points_per,
+                               gt_xs,
+                               gt_ys,
+                               radius=1):
+        '''
+        判断像是否为中心像素，需要满足的条件:像素在实际质心的正负1.5倍步长的范围内，并且像素在bbox内
+        input:
+        mask_center:(num_pixel, num_instance,2),传入是x，y
+        (gt_xs, gt_ys):图像中点的横纵坐标，需要判断点是否是中心像素
+        '''
+        center_y = mask_center[..., 0]
+        center_x = mask_center[..., 1]
+        center_gt = gt_bb.new_zeros(gt_bb.shape)
+        # no gt,该图像不含实例
+        if center_x[..., 0].sum() == 0:
+            return gt_xs.new_zeros(gt_xs.shape, dtype=torch.uint8)
+
+        beg = 0
+        for level, n_p in enumerate(num_points_per):
+            end = beg + n_p
+            stride = strides[level] * radius
+            xmin = center_x[beg:end] - stride
+            ymin = center_y[beg:end] - stride
+            xmax = center_x[beg:end] + stride
+            ymax = center_y[beg:end] + stride
+            # limit sample region in gt bbox
+            center_gt[beg:end, :, 0] = torch.where(xmin > gt_bb[beg:end, :, 0],
+                                                   xmin, gt_bb[beg:end, :, 0])
+            center_gt[beg:end, :, 1] = torch.where(ymin > gt_bb[beg:end, :, 1],
+                                                   ymin, gt_bb[beg:end, :, 1])
+            center_gt[beg:end, :, 2] = torch.where(xmax > gt_bb[beg:end, :, 2],
+                                                   gt_bb[beg:end, :, 2], xmax)
+            center_gt[beg:end, :, 3] = torch.where(ymax > gt_bb[beg:end, :, 3],
+                                                   gt_bb[beg:end, :, 3], ymax)
+            beg = end
+
+        left = gt_xs - center_gt[..., 0]
+        right = center_gt[..., 2] - gt_xs
+        top = gt_ys - center_gt[..., 1]
+        bottom = center_gt[..., 3] - gt_ys
+        center_bbox = torch.stack((left, top, right, bottom), -1)
+        inside_gt_bbox_mask = center_bbox.min(-1)[0] > 0  # 上下左右都>0 就是在bbox里面
+        return inside_gt_bbox_mask
+
+    def get_centerpoint(self, lis):
+        '''
+        https://www.jianshu.com/p/77234d0ac24e
+        多边形质心求解，是三角剖分后的各三角形的质心的加权和
+        '''
+        area = 0.0
+        x, y = 0.0, 0.0
+        a = len(lis)
+        for i in range(a):
+            lat = lis[i][0]
+            lng = lis[i][1]
+            if i == 0:
+                lat1 = lis[-1][0]
+                lng1 = lis[-1][1]
+            else:
+                lat1 = lis[i - 1][0]
+                lng1 = lis[i - 1][1]
+            fg = (lat * lng1 - lng * lat1) / 2.0
+            area += fg
+            x += fg * (lat + lat1) / 3.0
+            y += fg * (lng + lng1) / 3.0
+        x = x / area
+        y = y / area
+
+        return [int(x), int(y)]
+
+    def inner_dot(self, instance_mask, point):
+        '''
+        point是cv2中的格式
+        '''
+        xp, yp = point
+        h, w = instance_mask.shape
+        bool_inst_mask = instance_mask.astype(bool)
+        neg_bool_inst_mask = 1 - bool_inst_mask  # 背景像素
+        dot_mask = np.zeros(instance_mask.shape)
+        insth, instw = instance_mask.shape
+        dot_mask[yp][xp] = 1
+        # point不在instance mask内部
+        if yp + 1 >= h or yp - 1 < 0 or xp + 1 >= w or xp - 1 < 0:
+            return False
+        fill_mask = np.zeros((3, 3))
+        fill_mask.fill(1)
+
+        dot_mask[yp - 1:yp + 2,
+                 xp - 1:xp + 2] = fill_mask  # 中心点及中心点附近的元素 3*3,说明中心点在轮廓上
+        # 背景像素中存在在中心点附近的像素 ——> 中心点附近存在背景像素
+        not_inner = (neg_bool_inst_mask * dot_mask).any()
+        # print(np.sum(neg_bool_inst_mask),np.sum(dot_mask))
+        # print('neg_bool',np.unique(dot_mask))
+        return not not_inner
+
+    def judge_inner(self, mask, center):
+        bool_inst_mask = mask.astype(bool)
+        temp = np.zeros(mask.shape)
+        temp[int(center[1])][int(center[0])] = 1  # 数组和绘图使用的点是反的
+        if (bool_inst_mask * temp).any() and self.inner_dot(mask, center):
+            return True
+        else:
+            return False
+
+    # def add_edge(self, im):
+    #     h, w = im.shape[0], im.shape[1]
+    #     #add_edge_im = np.zeros((h+10,w+10))
+    #     #add_edge_im[5:h+5,5:w+5] = im
+    #     add_edge_im = im
+    #     return add_edge_im
+
+    # def get_gradient(self, im):
+    #     h, w = im.shape[0], im.shape[1]
+    #     im = self.add_edge(im)
+    #     instance_id = np.unique(im)[1]
+    #     # delete line
+    #     mask = np.zeros((im.shape[0], im.shape[1]))
+    #     mask.fill(instance_id)
+    #     boolmask = (im == mask)
+    #     im = im * boolmask  # only has object,and use one color to fill the instance
+
+    #     y = np.gradient(im)[0]
+    #     x = np.gradient(im)[1]
+    #     gradient = abs(x) + abs(y)
+    #     bool_gradient = gradient.astype(bool)
+    #     mask.fill(1)
+    #     gradient_map = mask * bool_gradient * boolmask
+    #     #gradient_map = gradient_map[5:h+5,5:w+5]
+    #     # 2d gradient map
+    #     return gradient_map
+
+    def get_inner_center(self, instance_mask):
+        inst_mask_h, inst_mask_w = np.where(
+            instance_mask)  # coordinates for foreground pixels
+
+        # get gradient_map
+        gradient_map = self.get_gradient(instance_mask)
+        grad_h, grad_w = np.where(gradient_map == 1)  # coordinates for contour
+
+        # inst_points
+        inst_points = np.array([[inst_mask_w[i], inst_mask_h[i]]
+                                for i in range(len(inst_mask_h))])
+        # edge_points
+        bounding_order = np.array([[grad_w[i], grad_h[i]]
+                                   for i in range(len(grad_h))])
+
+        try:
+            distance_result = distance.cdist(inst_points, bounding_order,
+                                             'euclidean')
+        except:
+            try:
+                distance_result = distance.cdist(inst_points[::2],
+                                                 bounding_order, 'euclidean')
+            except:
+                distance_result = distance.cdist(inst_points[::4],
+                                                 bounding_order, 'euclidean')
+        sum_distance = np.sum(distance_result, 1)
+        center_index = np.argmin(sum_distance)
+
+        center_distance = (inst_points[center_index][1],
+                           inst_points[center_index][0])
+        times_num = 0
+        while not self.inner_dot(instance_mask, center_distance):
+            times_num += 1
+            sum_distance = np.delete(sum_distance, center_index)
+            if len(sum_distance) == 0:
+                print('no center')
+                return None
+
+            center_index = np.argmin(sum_distance)
+            center_distance = [
+                int(inst_points[center_index][1]),
+                int(inst_points[center_index][0])
+            ]
+        return center_distance
+
+    def get_single_centerpoint(self, mask):
+        '''
+        input: 掩码
+        output: 中心坐标、掩码中的所有轮廓(按照面积大小排序)
+        '''
+        contour, _ = cv2.findContours(mask, cv2.RETR_TREE,
+                                      cv2.CHAIN_APPROX_NONE)
+        contour.sort(key=lambda x: cv2.contourArea(x),
+                     reverse=True)  # only save the biggest one
+        '''debug IndexError: list index out of range'''
+        count = contour[0][:, 0, :]
+
+        try:
+            center = self.get_centerpoint(count)  # 将质心作为中心
+        except:
+            # print('area is 0 when calculate mass center')
+            x, y = count.mean(axis=0)
+            center = [int(x), int(y)]  # 直接求坐标均值
+        # if self.fixed_gt:
+        #     # judge 'center' is in mask or not，if not, choose a point in mask
+        #     # temp = np.concatenate(
+        #     #     [mask[:, :, None], mask[:, :, None], mask[:, :, None]],
+        #     #     axis=2) * 255
+        #     # cv2.circle(temp, tuple(center), 5, (0, 0, 255))
+        #     # cv2.imwrite('demo.jpg', temp)
+        #     if self.ensure_inner:
+        #         if not self.judge_inner(mask, center):
+        #             print('mass center is not in mask')
+        #             center = self.get_inner_center(mask)
+        #             # cv2.circle(temp, tuple(center), 5, (0, 0, 255))
+        #             # cv2.imwrite('demo.jpg', temp)
+
+        return center, contour  # center is reverse
+
+    def get_angle_radius(self, c_x, c_y, target_contour_points_yx):
+        '''
+        输入mask，按照沿着轮廓点采样的方式得到gt
+        '''
+        x = target_contour_points_yx[:, 0] - c_x
+        y = target_contour_points_yx[:, 1] - c_y
+        angle_arc = torch.atan2(x, y)
+        radius = torch.sqrt(x**2 + y**2)
+        if self.sort:
+            print('use fixed gt with order — angle increasing')
+            angle_temp = angle_arc * 180 / np.pi
+            angle_temp[angle_temp < 0] += 360
+            angle_temp, idx = torch.sort(angle_temp)
+            radius = radius[idx]
+            target_contour_points_yx = target_contour_points_yx[idx]
+            angle_arc = angle_temp / 180 * np.pi
+        return target_contour_points_yx, angle_arc, radius
+
+    def get_deviation_xy(self, c_x, c_y, target_contour_points_yx):
+        '''
+        输入mask，按照沿着轮廓点采样的方式得到gt，输出的是当前点距离中心的偏移
+        '''
+        deviation_x = target_contour_points_yx[:, 0] - c_x
+        deviation_y = target_contour_points_yx[:, 1] - c_y
+        deviation_x = deviation_x[:, None]
+        deviation_y = deviation_y[:, None]
+        deviation = torch.cat([deviation_x, deviation_y], dim=1)
+        if self.normalize_factor < 1:
+            deviation = deviation * self.normalize_factor
+        return deviation
+
+    def __getitem__(self, idx):
+        if self.test_mode:
+            return self.prepare_test_img(idx)
+        while True:
+            data = self.prepare_train_img(idx)
+
+            if data is None:
+                idx = self._rand_another(idx)
+                continue
+            return data
+
+
+def polar2cartesian(center, radius, angle):
+    '''
+    与distance2mask一致
+    '''
+    x, y = center
+    x = x + torch.sin(angle) * radius
+    y = y + torch.cos(angle) * radius
+    res = torch.cat([x[:, None, :], y[:, None, :]], dim=1)
+
+    return res

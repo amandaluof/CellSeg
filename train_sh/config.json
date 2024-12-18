@@ -1,0 +1,10 @@
+{
+    "Token": "xWV_LtcQIH_7IbdIZU2Kiw",
+    "business_flag": "youtu_xlab_team2",
+    "model_local_file_path": "/apdcephfs/private_amandaaluo/PolarMask/train_sh",
+    "host_num": 1,
+    "host_gpu_num": 1,
+    "image_full_name": "mirrors.tencent.com/vincentwxu/polarmask:v1.0",
+    "readable_name": "polarmask",
+    "task_flag": "test_pro_ms2"
+}
