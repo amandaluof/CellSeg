@@ -9,20 +9,34 @@ This repo is based on [mmdetection](https://github.com/open-mmlab/mmdetection). 
 
 
 ## Training and Testing
-**Train:**
-##### 4gpu train
-- ```bash ./tools/dist_train.sh configs/panNuke/polar_init_refine_r50_centerness_polar_heatmap_5_10.py 4 --launcher pytorch --work_dir work_dirs/panNuke/polar_init_refine_r50_centerness_polar_heatmap_5_10```
-- ```CUDA_VISIBLE_DEVICES=2,3,4,6 bash ./tools/dist_train.sh configs/panNuke/polar_init_refine_r50_centerness_polar.py 4 --launcher pytorch --work_dir work_dirs/panNuke/polar_init_refine_r50_centerness_polar```
-- ```CUDA_VISIBLE_DEVICES=2,3,4,6 bash ./tools/dist_train.sh configs/polarmask/4gpu/polar_init_r50_centerness_polar.py 4 --launcher pytorch --work_dir work_dirs/panNuke/polar_init_r50_centerness_polar```
+**Train(4gpu):**
+### CFM+HBB
+```
+bash ./tools/dist_train.sh configs/panNuke/polar_init_refine_r50_centerness_polar_heatmap_5_10.py 4 --launcher pytorch --work_dir work_dirs/panNuke/polar_init_refine_r50_centerness_polar_heatmap_5_10
+```
+### HBB
+```
+CUDA_VISIBLE_DEVICES=2,3,4,6 bash ./tools/dist_train.sh configs/panNuke/polar_init_refine_r50_centerness_polar.py 4 --launcher pytorch --work_dir work_dirs/panNuke/polar_init_refine_r50_centerness_polar
+```
+### PolarMask
+```
+CUDA_VISIBLE_DEVICES=2,3,4,6 bash ./tools/dist_train.sh configs/polarmask/4gpu/polar_init_r50_centerness_polar.py 4 --launcher pytorch --work_dir work_dirs/panNuke/polar_init_r50_centerness_polar
+```
 
 
-
-
-**Test:**
-##### 4gpu test
-- ```bash tools/dist_test.sh configs/panNuke/polar_init_refine_r50_centerness_polar_heatmap_5_10.py ./work_dirs/panNuke/polar_init_refine_r50_centerness_polar_heatmap_5_10/latest.pth 4 --out work_dirs/panNuke/polar_init_refine_r50_centerness_polar_heatmap_5_10/res.pkl --eval segm```
-- ```bash tools/dist_test.sh configs/panNuke/polar_init_refine_r50_centerness_polar.py ./work_dirs/panNuke/polar_init_refine_r50_centerness_polar/latest.pth 4 --out ./work_dirs/panNuke/polar_init_refine_r50_centerness_polar/res.pkl --eval segm```
-- ```bash tools/dist_test.sh configs/panNuke/polar_init_r50_centerness_polar.py ./work_dirs/panNuke/polar_init_r50_centerness_polar/latest.pth 4 --out ./work_dirs/panNuke/polar_init_r50_centerness_polar/res.pkl --eval segm```
+**Test(4gpu):**
+### CFM+HBB
+```
+bash tools/dist_test.sh configs/panNuke/polar_init_refine_r50_centerness_polar_heatmap_5_10.py ./work_dirs/panNuke/polar_init_refine_r50_centerness_polar_heatmap_5_10/latest.pth 4 --out work_dirs/panNuke/polar_init_refine_r50_centerness_polar_heatmap_5_10/res.pkl --eval segm
+```
+### HBB
+```
+bash tools/dist_test.sh configs/panNuke/polar_init_refine_r50_centerness_polar.py ./work_dirs/panNuke/polar_init_refine_r50_centerness_polar/latest.pth 4 --out ./work_dirs/panNuke/polar_init_refine_r50_centerness_polar/res.pkl --eval segm
+```
+### PolarMask
+```
+bash tools/dist_test.sh configs/panNuke/polar_init_r50_centerness_polar.py ./work_dirs/panNuke/polar_init_r50_centerness_polar/latest.pth 4 --out ./work_dirs/panNuke/polar_init_r50_centerness_polar/res.pkl --eval segm
+```
 
 
 
